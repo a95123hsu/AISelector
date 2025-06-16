@@ -21,19 +21,37 @@ supabase = init_supabase()
 
 # --- Load pump data from Supabase ---
 @st.cache_data
-def load_data():
+def load_data(table_name):
     if not supabase:
         return pd.DataFrame()
     
     try:
-        response = supabase.table("pump_specs").select("*").execute()
+        response = supabase.table(table_name).select("*").execute()
         df = pd.DataFrame(response.data)
         
-        # Clean and prepare the data
         if not df.empty:
-            # Fix column name inconsistency (your code uses "Max Head (M)" but CSV has "Max Head(M)")
+            st.success(f"✅ Connected to table: {table_name} ({len(df)} records)")
+            
+            # Clean and prepare the data
+            # Fix column name inconsistency (CSV has "Max Head(M)" but we want "Max Head (M)")
             if "Max Head(M)" in df.columns and "Max Head (M)" not in df.columns:
                 df["Max Head (M)"] = df["Max Head(M)"]
+            
+            # Ensure we have the required columns
+            required_columns = ["Model No.", "Max Flow (LPM)"]
+            head_column = "Max Head(M)" if "Max Head(M)" in df.columns else "Max Head (M)"
+            
+            if head_column in df.columns:
+                required_columns.append(head_column)
+                # Standardize to the expected name
+                if head_column == "Max Head(M)":
+                    df["Max Head (M)"] = df["Max Head(M)"]
+            
+            # Check if we have all required columns
+            missing_columns = [col for col in ["Model No.", "Max Flow (LPM)", "Max Head (M)"] if col not in df.columns]
+            if missing_columns:
+                st.error(f"Table {table_name} is missing required columns: {missing_columns}")
+                return pd.DataFrame()
             
             # Ensure numeric columns are properly typed
             numeric_columns = ["Max Flow (LPM)", "Max Head (M)"]
@@ -42,18 +60,30 @@ def load_data():
                     df[col] = pd.to_numeric(df[col], errors="coerce")
             
             # Remove rows with NaN values in critical columns
+            original_count = len(df)
             df = df.dropna(subset=numeric_columns)
-        
-        return df
+            if len(df) < original_count:
+                st.info(f"Removed {original_count - len(df)} rows with missing data")
+            
+            return df
+            
     except APIError as e:
-        st.error(f"Error accessing pump_specs table: {str(e)}")
+        st.error(f"Error accessing table {table_name}: {str(e)}")
         return pd.DataFrame()
     except Exception as e:
-        st.error(f"Unexpected error loading data: {str(e)}")
+        st.error(f"Unexpected error with table {table_name}: {str(e)}")
         return pd.DataFrame()
 
 # --- App UI ---
 st.title("🔍 Pump Selector Assistant")
+
+# Table selection
+st.sidebar.header("📊 Database Settings")
+selected_table = st.sidebar.selectbox(
+    "Select Pump Data Table",
+    ["pump_curve_data", "pump_selection_data"],
+    help="Choose which table to use for pump data"
+)
 
 # Initialize chat history
 if "messages" not in st.session_state:
@@ -74,7 +104,7 @@ with col2:
     head = st.number_input("Required Head (m)", min_value=0.0, value=0.0, step=0.5)
 
 # Load data
-df = load_data()
+df = load_data(selected_table)
 
 # --- Search and Filter ---
 if st.button("Search", disabled=(flow <= 0 or head <= 0)):
