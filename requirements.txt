@@ -3,4 +3,4 @@ openai
 pandas
 python-dotenv
 supabase
-plotly.graph_objects
+plotly
