@@ -235,21 +235,14 @@ def generate_organized_response(user_message, df, flow=None, head=None, model_no
             
             if model_no and model_no in df["Model No."].values:
                 context = f"""
-You are a pump expert. The user asked about pump model {model_no}. 
-
-Provide a brief, organized response that:
-1. Acknowledges their request for the pump curve
-2. Mentions key specifications of this model
-3. Explains what they'll see in the curve plot
-
-Keep it concise and professional. The pump curve will be displayed automatically.
+User asked about pump model {model_no}. Give a brief 1-2 sentence response acknowledging their request and mentioning the curve will be shown below.
 """
                 
                 client = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
                 response = client.chat.completions.create(
                     model="gpt-4o-mini",
                     messages=[{"role": "user", "content": context}],
-                    max_tokens=200,
+                    max_tokens=50,
                     temperature=0.7
                 )
                 
@@ -297,13 +290,7 @@ Found {len(filtered_pumps)} suitable pumps. Top 5 matches:
 
         context += """
 
-Provide a response with this structure:
-1. **Summary**: Brief acknowledgment of their request
-2. **Analysis**: What you found based on their requirements
-3. **Recommendations**: Specific pump suggestions (if any)
-4. **Next Steps**: What they can do next or questions to ask
-
-Use markdown formatting for headers. Be concise but helpful.
+Keep your response SHORT and conversational. Maximum 2-3 sentences. Don't use headers or bullet points. Just be helpful and direct.
 """
 
         # Call OpenAI API
@@ -311,7 +298,7 @@ Use markdown formatting for headers. Be concise but helpful.
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": context}],
-            max_tokens=400,
+            max_tokens=100,
             temperature=0.7
         )
         
