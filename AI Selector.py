@@ -6,7 +6,19 @@ import time
 from postgrest.exceptions import APIError
 import re
 import plotly.graph_objects as go
-import plotly.express as px
+import io
+
+# LangChain imports
+try:
+    from langchain_openai import OpenAIEmbeddings, OpenAI
+    from langchain_community.vectorstores import FAISS
+    from langchain.chains import RetrievalQA
+    from langchain.docstore.document import Document
+    from langchain.text_splitter import CharacterTextSplitter
+    LANGCHAIN_AVAILABLE = True
+except ImportError:
+    LANGCHAIN_AVAILABLE = False
+    st.warning("⚠️ LangChain not installed. Install with: pip install langchain langchain-openai langchain-community faiss-cpu")
 
 # --- Initialize Supabase ---
 @st.cache_resource
@@ -70,6 +82,63 @@ def load_data(table_name):
         st.error(f"Unexpected error with table {table_name}: {str(e)}")
         return pd.DataFrame()
 
+# --- RAG Setup ---
+@st.cache_resource
+def setup_rag_pipeline(df):
+    """Setup LangChain RAG pipeline with pump data"""
+    if not LANGCHAIN_AVAILABLE or "OPENAI_API_KEY" not in st.secrets:
+        return None
+    
+    try:
+        # Convert DataFrame to documents
+        documents = []
+        for _, row in df.iterrows():
+            # Create a comprehensive text representation of each pump
+            pump_text = f"""
+Model: {row['Model No.']}
+Max Flow: {row['Max Flow (LPM)']} LPM
+Max Head: {row['Max Head (M)']} meters
+"""
+            
+            # Add performance data points if available
+            performance_points = []
+            for col in df.columns:
+                if col.endswith('M') and col not in ['Model No.', 'Max Flow (LPM)', 'Max Head (M)', 'Max Head(M)']:
+                    if pd.notna(row[col]) and row[col] > 0:
+                        head_val = col.replace('M', '').strip()
+                        performance_points.append(f"At {head_val}m head: {row[col]} LPM")
+            
+            if performance_points:
+                pump_text += "Performance curve data:\n" + "\n".join(performance_points)
+            
+            # Add other specifications if available
+            for col in df.columns:
+                if col not in ['Model No.', 'Max Flow (LPM)', 'Max Head (M)', 'Max Head(M)'] and not col.endswith('M'):
+                    if pd.notna(row[col]):
+                        pump_text += f"\n{col}: {row[col]}"
+            
+            doc = Document(page_content=pump_text, metadata={"model": row['Model No.']})
+            documents.append(doc)
+        
+        # Create embeddings and vector store
+        embeddings = OpenAIEmbeddings(openai_api_key=st.secrets["OPENAI_API_KEY"])
+        vectorstore = FAISS.from_documents(documents, embeddings)
+        
+        # Create RAG chain
+        llm = OpenAI(openai_api_key=st.secrets["OPENAI_API_KEY"], temperature=0.3)
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=llm,
+            chain_type="stuff",
+            retriever=vectorstore.as_retriever(search_kwargs={"k": 5}),
+            return_source_documents=True
+        )
+        
+        return qa_chain
+        
+    except Exception as e:
+        st.error(f"Error setting up RAG pipeline: {str(e)}")
+        return None
+
 # --- Pump Curve Plotting ---
 def plot_pump_curve(df, model_no):
     """Generate pump curve plot for a specific model"""
@@ -102,13 +171,6 @@ def plot_pump_curve(df, model_no):
                             flows.append(float(flow_val))
                 except (ValueError, TypeError):
                     continue
-        
-        # Debug: Show what data we found
-        st.write(f"**Debug info for {model_no}:**")
-        st.write(f"Found {len(flows)} data points")
-        if len(flows) > 0:
-            for h, f in zip(heads, flows):
-                st.write(f"Head: {h}m → Flow: {f} LPM")
         
         if len(flows) < 2:
             st.warning(f"Not enough data points to plot curve for {model_no} (found {len(flows)} points)")
@@ -153,7 +215,7 @@ def plot_pump_curve(df, model_no):
         st.error(f"Error plotting pump curve: {str(e)}")
         return None
 
-# --- Helper Functions for AI Chat ---
+# --- Helper Functions ---
 def extract_flow_head_from_text(text):
     """Extract flow and head requirements from user text"""
     flow_patterns = [
@@ -189,7 +251,6 @@ def extract_flow_head_from_text(text):
 
 def extract_model_from_text(text):
     """Extract pump model number from user text"""
-    # Look for patterns like "show curve for 65ADL51.5" or "plot 80ADL52.2"
     model_patterns = [
         r'(?:show|plot|curve|graph).*?([A-Z0-9]+[A-Z]+[0-9]+(?:\.[0-9]+)?)',
         r'model[:\s]*([A-Z0-9]+[A-Z]+[0-9]+(?:\.[0-9]+)?)',
@@ -227,17 +288,8 @@ def search_pumps(df, flow=None, head=None):
     
     return filtered
 
-def generate_organized_response(user_message, df, flow=None, head=None, model_no=None):
-    """Generate organized AI response based on user message and pump data"""
-    if "OPENAI_API_KEY" not in st.secrets:
-        return {
-            "response": "I'd love to help you with pump selection, but I need an OpenAI API key to provide intelligent responses. For now, I can help you search for pumps if you tell me your flow (LPM) and head (meters) requirements!",
-            "show_pumps": False,
-            "show_curve": False,
-            "pumps_data": pd.DataFrame(),
-            "curve_model": None
-        }
-    
+def generate_rag_response(user_message, qa_chain, df, flow=None, head=None, model_no=None):
+    """Generate response using RAG pipeline"""
     try:
         # Check if user wants to see a pump curve
         if model_no or any(word in user_message.lower() for word in ['curve', 'plot', 'graph', 'chart']):
@@ -245,85 +297,60 @@ def generate_organized_response(user_message, df, flow=None, head=None, model_no
                 model_no = extract_model_from_text(user_message)
             
             if model_no and model_no in df["Model No."].values:
-                context = f"""
-User asked about pump model {model_no}. Give a brief 1-2 sentence response acknowledging their request and mentioning the curve will be shown below.
-"""
-                
-                client = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-                response = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": context}],
-                    max_tokens=50,
-                    temperature=0.7
-                )
-                
                 return {
-                    "response": response.choices[0].message.content,
+                    "response": f"Here's the pump curve for {model_no}. You can see its flow vs head performance below.",
                     "show_pumps": False,
                     "show_curve": True,
                     "pumps_data": pd.DataFrame(),
                     "curve_model": model_no
                 }
         
-        # Search for relevant pumps
-        filtered_pumps = search_pumps(df, flow, head)
-        
-        # Prepare context for AI
-        context = f"""
-You are a pump selection expert. Provide a well-organized response to the user.
+        # Use RAG for pump selection
+        if qa_chain:
+            # Enhance the question with context
+            enhanced_query = f"""
+User question: {user_message}
 
-User message: "{user_message}"
-
-Database info:
-- Total pumps available: {len(df)}
-- Flow range: {df['Max Flow (LPM)'].min():.0f} - {df['Max Flow (LPM)'].max():.0f} LPM
-- Head range: {df['Max Head (M)'].min():.1f} - {df['Max Head (M)'].max():.1f} meters
-
+Please help find suitable pumps. Consider:
+- Flow requirement: {flow if flow else 'not specified'} LPM
+- Head requirement: {head if head else 'not specified'} meters
+- Provide specific model recommendations with brief explanations
+- Keep response concise (2-3 sentences max)
 """
-
-        if flow is not None or head is not None:
-            context += f"""
-Requirements extracted:
-- Flow needed: {flow if flow else 'Not specified'} LPM
-- Head needed: {head if head else 'Not specified'} meters
-
-"""
-
-        if not filtered_pumps.empty:
-            top_5 = filtered_pumps.head(5)
-            context += f"""
-Found {len(filtered_pumps)} suitable pumps. Top 5 matches:
-{top_5[['Model No.', 'Max Flow (LPM)', 'Max Head (M)']].to_string(index=False)}
-"""
+            
+            result = qa_chain({"query": enhanced_query})
+            response_text = result["answer"]
+            
+            # Get matching pumps for table display
+            filtered_pumps = search_pumps(df, flow, head)
+            
+            return {
+                "response": response_text,
+                "show_pumps": len(filtered_pumps) > 0,
+                "show_curve": False,
+                "pumps_data": filtered_pumps,
+                "curve_model": None
+            }
         else:
-            if flow is not None and head is not None:
-                context += f"No pumps found for {flow} LPM and {head}m. Suggest alternatives."
-
-        context += """
-
-Keep your response SHORT and conversational. Maximum 2-3 sentences. Don't use headers or bullet points. Just be helpful and direct.
-"""
-
-        # Call OpenAI API
-        client = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": context}],
-            max_tokens=100,
-            temperature=0.7
-        )
-        
-        return {
-            "response": response.choices[0].message.content,
-            "show_pumps": len(filtered_pumps) > 0,
-            "show_curve": False,
-            "pumps_data": filtered_pumps,
-            "curve_model": None
-        }
-        
+            # Fallback to simple search if RAG not available
+            filtered_pumps = search_pumps(df, flow, head)
+            
+            if not filtered_pumps.empty:
+                response_text = f"Found {len(filtered_pumps)} pumps that meet your requirements. Check the recommendations below."
+            else:
+                response_text = "No pumps found for your specific requirements. Try adjusting your flow or head needs."
+            
+            return {
+                "response": response_text,
+                "show_pumps": len(filtered_pumps) > 0,
+                "show_curve": False,
+                "pumps_data": filtered_pumps,
+                "curve_model": None
+            }
+            
     except Exception as e:
         return {
-            "response": f"I encountered an error: {str(e)}. But I'm still here to help! Could you tell me your flow (LPM) and head (meters) requirements?",
+            "response": f"Error processing your request: {str(e)}. Please try again.",
             "show_pumps": False,
             "show_curve": False,
             "pumps_data": pd.DataFrame(),
@@ -331,8 +358,8 @@ Keep your response SHORT and conversational. Maximum 2-3 sentences. Don't use he
         }
 
 # --- App UI ---
-st.title("🔍 Pump Selector Assistant")
-st.caption("Ask me about pump requirements and I'll help you find the perfect match! Try asking for pump curves too! 📊")
+st.title("🔍 AI-Powered Pump Selector")
+st.caption("Smart pump recommendations using RAG (Retrieval-Augmented Generation) 🤖📊")
 
 # Table selection in sidebar
 with st.sidebar:
@@ -343,7 +370,7 @@ with st.sidebar:
         help="Choose which table to use for pump data"
     )
     
-    # Load and display data info
+    # Load data
     df = load_data(selected_table)
     
     if not df.empty:
@@ -351,32 +378,39 @@ with st.sidebar:
         st.metric("Flow Range", f"{df['Max Flow (LPM)'].min():.0f} - {df['Max Flow (LPM)'].max():.0f} LPM")
         st.metric("Head Range", f"{df['Max Head (M)'].min():.1f} - {df['Max Head (M)'].max():.1f} m")
         
-        # Debug: Show column names
-        st.header("📋 Available Columns")
-        head_cols = [col for col in df.columns if col.endswith('M')]
-        st.write("Head measurement columns:")
-        for col in head_cols:
-            st.text(f"• {col}")
+        # Setup RAG pipeline
+        if LANGCHAIN_AVAILABLE and "OPENAI_API_KEY" in st.secrets:
+            with st.spinner("Setting up AI knowledge base..."):
+                qa_chain = setup_rag_pipeline(df)
+            if qa_chain:
+                st.success("🧠 AI knowledge base ready!")
+            else:
+                st.warning("⚠️ Using basic search (RAG setup failed)")
+                qa_chain = None
+        else:
+            st.warning("⚠️ RAG not available - using basic search")
+            qa_chain = None
         
         st.header("🎯 Available Models")
-        models = df["Model No."].unique()[:10]  # Show first 10 models
+        models = df["Model No."].unique()[:8]
         for model in models:
             st.text(f"• {model}")
-        if len(df) > 10:
-            st.text(f"... and {len(df) - 10} more")
+        if len(df) > 8:
+            st.text(f"... and {len(df) - 8} more")
     else:
         st.error("❌ No data loaded")
+        qa_chain = None
     
     st.header("💡 Example Questions")
     st.write("• I need 500 LPM and 10 meters head")
-    st.write("• Show me pumps for high flow")
-    st.write("• Plot curve for model 65ADL51.5")
-    st.write("• What's the best pump for 300 LPM?")
+    st.write("• Best pump for swimming pool")
+    st.write("• Show curve for 65ADL51.5")
+    st.write("• High flow low head applications")
 
 # Initialize chat history
 if "messages" not in st.session_state:
     st.session_state.messages = [
-        {"role": "assistant", "content": "Hello! I'm your intelligent pump selection assistant. I can help you:\n\n🔍 **Find pumps** based on your flow and head requirements\n📊 **Show pump curves** for specific models\n💡 **Provide recommendations** for your applications\n\nJust tell me what you need!"}
+        {"role": "assistant", "content": "Hello! I'm your AI pump selection assistant powered by advanced RAG technology. I can help you find the perfect pump and show performance curves. What do you need? 🚀"}
     ]
 
 # Display chat messages from history
@@ -385,23 +419,22 @@ for message in st.session_state.messages:
         st.markdown(message["content"])
 
 # Accept user input
-if prompt := st.chat_input("Ask me about pumps... (e.g., 'I need 500 LPM and 10m head' or 'show curve for 65ADL51.5')"):
+if prompt := st.chat_input("Ask me about pumps... (e.g., 'I need 80 LPM and 10 meters head')"):
     # Add user message to chat history
     st.session_state.messages.append({"role": "user", "content": prompt})
     
-    # Display user message in chat message container
+    # Display user message
     with st.chat_message("user"):
         st.markdown(prompt)
     
-    # Display assistant response in chat message container
+    # Display assistant response
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
         full_response = ""
         
         if df.empty:
-            assistant_response = "I'm sorry, but I can't access the pump database right now. Please check the connection and try again."
             response_data = {
-                "response": assistant_response,
+                "response": "I can't access the pump database right now. Please check the connection.",
                 "show_pumps": False,
                 "show_curve": False,
                 "pumps_data": pd.DataFrame(),
@@ -412,16 +445,16 @@ if prompt := st.chat_input("Ask me about pumps... (e.g., 'I need 500 LPM and 10m
             flow, head = extract_flow_head_from_text(prompt)
             model_no = extract_model_from_text(prompt)
             
-            # Generate organized AI response
-            response_data = generate_organized_response(prompt, df, flow, head, model_no)
+            # Generate AI response using RAG
+            response_data = generate_rag_response(prompt, qa_chain, df, flow, head, model_no)
         
         assistant_response = response_data["response"]
         
-        # Simulate stream of response with typing effect
+        # Simulate typing effect
         words = assistant_response.split()
         for i, word in enumerate(words):
             full_response += word + " "
-            if i % 3 == 0:  # Update every 3 words for smoother animation
+            if i % 3 == 0:
                 time.sleep(0.02)
                 message_placeholder.markdown(full_response + "▌")
         
@@ -434,35 +467,34 @@ if prompt := st.chat_input("Ask me about pumps... (e.g., 'I need 500 LPM and 10m
             if curve_fig:
                 st.plotly_chart(curve_fig, use_container_width=True)
             else:
-                st.warning(f"Could not generate pump curve for {response_data['curve_model']}. Insufficient data points.")
+                st.warning(f"Could not generate pump curve for {response_data['curve_model']}")
         
-        # Show matching pumps table if found
+        # Show matching pumps table
         if response_data["show_pumps"] and not response_data["pumps_data"].empty:
             st.subheader("🎯 Recommended Pumps")
-            # Show ALL columns
             st.dataframe(
                 response_data["pumps_data"].head(10).reset_index(drop=True),
                 use_container_width=True,
                 hide_index=True
             )
             
-            # Add buttons to show curves for recommended pumps
+            # Quick curve buttons
             if len(response_data["pumps_data"]) > 0:
-                st.write("**Show pump curves:**")
-                cols = st.columns(min(5, len(response_data["pumps_data"])))
-                for i, (_, pump) in enumerate(response_data["pumps_data"].head(5).iterrows()):
+                st.write("**Quick curve view:**")
+                cols = st.columns(min(4, len(response_data["pumps_data"])))
+                for i, (_, pump) in enumerate(response_data["pumps_data"].head(4).iterrows()):
                     with cols[i]:
                         if st.button(f"📊 {pump['Model No.']}", key=f"curve_{i}"):
                             curve_fig = plot_pump_curve(df, pump['Model No.'])
                             if curve_fig:
                                 st.plotly_chart(curve_fig, use_container_width=True)
     
-    # Add assistant response to chat history
+    # Add to chat history
     st.session_state.messages.append({"role": "assistant", "content": full_response})
 
-# Clear chat history button
+# Clear chat history
 if st.sidebar.button("🗑️ Clear Chat History"):
     st.session_state.messages = [
-        {"role": "assistant", "content": "Hello! I'm your intelligent pump selection assistant. I can help you:\n\n🔍 **Find pumps** based on your flow and head requirements\n📊 **Show pump curves** for specific models\n💡 **Provide recommendations** for your applications\n\nJust tell me what you need!"}
+        {"role": "assistant", "content": "Hello! I'm your AI pump selection assistant powered by advanced RAG technology. I can help you find the perfect pump and show performance curves. What do you need? 🚀"}
     ]
     st.rerun()
