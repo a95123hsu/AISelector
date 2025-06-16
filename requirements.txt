@@ -1,6 +1,9 @@
 streamlit
-openai
 pandas
-python-dotenv
+openai
 supabase
+time
+postgrest
+re
 plotly
+io
