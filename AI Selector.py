@@ -4,17 +4,34 @@ import pandas as pd
 import openai
 from supabase import create_client
 import time
+from postgrest.exceptions import APIError
 
 # --- Initialize Supabase ---
-url = st.secrets["SUPABASE_URL"]
-key = st.secrets["SUPABASE_KEY"]
-supabase = create_client(url, key)
+try:
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    supabase = create_client(url, key)
+    
+    # Test connection
+    st.write("Testing Supabase connection...")
+    response = supabase.table("pump_specs").select("count").execute()
+    st.write("Connection successful!")
+except Exception as e:
+    st.error(f"Error connecting to Supabase: {str(e)}")
+    st.stop()
 
 # --- Load pump data from Supabase ---
 @st.cache_data
 def load_data():
-    response = supabase.table("pump_specs").select("*").execute()
-    return pd.DataFrame(response.data)
+    try:
+        response = supabase.table("pump_specs").select("*").execute()
+        return pd.DataFrame(response.data)
+    except APIError as e:
+        st.error(f"Error accessing pump_specs table: {str(e)}")
+        return pd.DataFrame()  # Return empty DataFrame on error
+    except Exception as e:
+        st.error(f"Unexpected error: {str(e)}")
+        return pd.DataFrame()  # Return empty DataFrame on error
 
 df = load_data()
 
@@ -48,25 +65,28 @@ if st.button("Search"):
         message_placeholder = st.empty()
         full_response = ""
         
-        # Ensure numeric values for filtering
-        df["Max Flow (LPM)"] = pd.to_numeric(df["Max Flow (LPM)"], errors="coerce")
-        df["Max Head (M)"] = pd.to_numeric(df["Max Head (M)"], errors="coerce")
-
-        filtered = df[
-            (df["Max Flow (LPM)"] >= flow) &
-            (df["Max Head (M)"] >= head)
-        ]
-
-        # Prepare response
-        if filtered.empty:
-            response_text = "I couldn't find any suitable pumps for your requirements. Would you like to try different specifications?"
+        if df.empty:
+            response_text = "I'm sorry, but I'm having trouble accessing the pump database at the moment. Please try again later."
         else:
-            response_text = f"I found {len(filtered)} matching pump(s) for your requirements. Here are the details:\n\n"
-            for _, row in filtered.iterrows():
-                response_text += f"Model: {row['Model No.']}\n"
-                response_text += f"Max Flow: {row['Max Flow (LPM)']} LPM\n"
-                response_text += f"Max Head: {row['Max Head (M)']} m\n"
-                response_text += f"Product Link: {row['Product Link']}\n\n"
+            # Ensure numeric values for filtering
+            df["Max Flow (LPM)"] = pd.to_numeric(df["Max Flow (LPM)"], errors="coerce")
+            df["Max Head (M)"] = pd.to_numeric(df["Max Head (M)"], errors="coerce")
+
+            filtered = df[
+                (df["Max Flow (LPM)"] >= flow) &
+                (df["Max Head (M)"] >= head)
+            ]
+
+            # Prepare response
+            if filtered.empty:
+                response_text = "I couldn't find any suitable pumps for your requirements. Would you like to try different specifications?"
+            else:
+                response_text = f"I found {len(filtered)} matching pump(s) for your requirements. Here are the details:\n\n"
+                for _, row in filtered.iterrows():
+                    response_text += f"Model: {row['Model No.']}\n"
+                    response_text += f"Max Flow: {row['Max Flow (LPM)']} LPM\n"
+                    response_text += f"Max Head: {row['Max Head (M)']} m\n"
+                    response_text += f"Product Link: {row['Product Link']}\n\n"
 
         # Simulate typing effect
         for chunk in response_text.split():
@@ -79,7 +99,7 @@ if st.button("Search"):
     st.session_state.messages.append({"role": "assistant", "content": full_response})
 
     # Display results in a more structured way
-    if not filtered.empty:
+    if not df.empty and not filtered.empty:
         st.success(f"Found {len(filtered)} matching pump(s).")
         st.dataframe(filtered[["Model No.", "Max Flow (LPM)", "Max Head (M)", "Product Link"]])
 
@@ -93,9 +113,12 @@ Data:
 
 Do not make assumptions beyond this data. If uncertain, say no match found.
 """
-            openai.api_key = st.secrets["OPENAI_API_KEY"]
-            response = openai.ChatCompletion.create(
-                model="gpt-4",
-                messages=[{"role": "user", "content": summary_prompt}]
-            )
-            st.write(response.choices[0].message["content"])
+            try:
+                openai.api_key = st.secrets["OPENAI_API_KEY"]
+                response = openai.ChatCompletion.create(
+                    model="gpt-4",
+                    messages=[{"role": "user", "content": summary_prompt}]
+                )
+                st.write(response.choices[0].message["content"])
+            except Exception as e:
+                st.error(f"Error generating AI suggestion: {str(e)}")
