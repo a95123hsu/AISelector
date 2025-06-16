@@ -4,6 +4,7 @@ import openai
 from supabase import create_client
 import time
 from postgrest.exceptions import APIError
+import re
 
 # --- Initialize Supabase ---
 @st.cache_resource
@@ -30,8 +31,6 @@ def load_data(table_name):
         df = pd.DataFrame(response.data)
         
         if not df.empty:
-            st.success(f"✅ Connected to table: {table_name} ({len(df)} records)")
-            
             # Clean and prepare the data
             # Fix column name inconsistency (CSV has "Max Head(M)" but we want "Max Head (M)")
             if "Max Head(M)" in df.columns and "Max Head (M)" not in df.columns:
@@ -60,10 +59,7 @@ def load_data(table_name):
                     df[col] = pd.to_numeric(df[col], errors="coerce")
             
             # Remove rows with NaN values in critical columns
-            original_count = len(df)
             df = df.dropna(subset=numeric_columns)
-            if len(df) < original_count:
-                st.info(f"Removed {original_count - len(df)} rows with missing data")
             
             return df
             
@@ -74,21 +70,159 @@ def load_data(table_name):
         st.error(f"Unexpected error with table {table_name}: {str(e)}")
         return pd.DataFrame()
 
+# --- Helper Functions for AI Chat ---
+def extract_flow_head_from_text(text):
+    """Extract flow and head requirements from user text"""
+    flow_patterns = [
+        r'(\d+(?:\.\d+)?)\s*(?:lpm|l/min|liters?\s*per\s*minute)',
+        r'flow[:\s]*(\d+(?:\.\d+)?)',
+        r'(\d+(?:\.\d+)?)\s*flow'
+    ]
+    
+    head_patterns = [
+        r'(\d+(?:\.\d+)?)\s*(?:m|meter|metre)s?\s*(?:head|height)',
+        r'head[:\s]*(\d+(?:\.\d+)?)',
+        r'(\d+(?:\.\d+)?)\s*(?:m|meter|metre)s?'
+    ]
+    
+    flow = None
+    head = None
+    
+    text_lower = text.lower()
+    
+    for pattern in flow_patterns:
+        match = re.search(pattern, text_lower, re.IGNORECASE)
+        if match:
+            flow = float(match.group(1))
+            break
+    
+    for pattern in head_patterns:
+        match = re.search(pattern, text_lower, re.IGNORECASE)
+        if match:
+            head = float(match.group(1))
+            break
+    
+    return flow, head
+
+def search_pumps(df, flow=None, head=None):
+    """Search for suitable pumps based on requirements"""
+    if df.empty:
+        return pd.DataFrame()
+    
+    filtered = df.copy()
+    
+    if flow is not None:
+        filtered = filtered[filtered["Max Flow (LPM)"] >= flow]
+    
+    if head is not None:
+        filtered = filtered[filtered["Max Head (M)"] >= head]
+    
+    if not filtered.empty and flow is not None and head is not None:
+        # Sort by efficiency
+        filtered["flow_efficiency"] = filtered["Max Flow (LPM)"] / flow
+        filtered["head_efficiency"] = filtered["Max Head (M)"] / head
+        filtered["total_efficiency"] = filtered["flow_efficiency"] + filtered["head_efficiency"]
+        filtered = filtered.sort_values("total_efficiency")
+    
+    return filtered
+
+def generate_ai_response(user_message, df, flow=None, head=None):
+    """Generate AI response based on user message and pump data"""
+    if "OPENAI_API_KEY" not in st.secrets:
+        return "I'd love to help you with pump selection, but I need an OpenAI API key to provide intelligent responses. For now, I can help you search for pumps if you tell me your flow (LPM) and head (meters) requirements!"
+    
+    try:
+        # Search for relevant pumps
+        filtered_pumps = search_pumps(df, flow, head)
+        
+        # Prepare context for AI
+        context = f"""
+You are a pump selection expert assistant. Help the user with their pump selection needs.
+
+User message: "{user_message}"
+
+Available pump database summary:
+- Total pumps: {len(df)}
+- Flow range: {df['Max Flow (LPM)'].min():.0f} - {df['Max Flow (LPM)'].max():.0f} LPM
+- Head range: {df['Max Head (M)'].min():.1f} - {df['Max Head (M)'].max():.1f} meters
+
+"""
+
+        if flow is not None or head is not None:
+            context += f"""
+Extracted requirements:
+- Flow: {flow if flow else 'Not specified'} LPM
+- Head: {head if head else 'Not specified'} meters
+
+"""
+
+        if not filtered_pumps.empty:
+            top_3 = filtered_pumps.head(3)
+            context += f"""
+Found {len(filtered_pumps)} matching pumps. Top 3 recommendations:
+{top_3[['Model No.', 'Max Flow (LPM)', 'Max Head (M)']].to_string(index=False)}
+"""
+        else:
+            if flow is not None and head is not None:
+                context += f"No pumps found that can handle {flow} LPM and {head} meters. Suggest alternatives or ask for different requirements."
+
+        context += """
+
+Instructions:
+1. Be helpful and conversational
+2. If requirements were extracted, provide specific pump recommendations
+3. If no requirements found, ask clarifying questions about flow and head needs
+4. Keep responses concise but informative
+5. Always be encouraging and professional
+"""
+
+        # Call OpenAI API
+        client = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": context}],
+            max_tokens=400,
+            temperature=0.7
+        )
+        
+        return response.choices[0].message.content
+        
+    except Exception as e:
+        return f"I encountered an error while processing your request: {str(e)}. But I'm still here to help! Could you tell me your flow (LPM) and head (meters) requirements?"
+
 # --- App UI ---
 st.title("🔍 Pump Selector Assistant")
+st.caption("Ask me about pump requirements and I'll help you find the perfect match! 🤖")
 
-# Table selection
-st.sidebar.header("📊 Database Settings")
-selected_table = st.sidebar.selectbox(
-    "Select Pump Data Table",
-    ["pump_curve_data", "pump_selection_data"],
-    help="Choose which table to use for pump data"
-)
+# Table selection in sidebar
+with st.sidebar:
+    st.header("📊 Database Settings")
+    selected_table = st.selectbox(
+        "Select Pump Data Table",
+        ["pump_curve_data", "pump_selection_data"],
+        help="Choose which table to use for pump data"
+    )
+    
+    # Load and display data info
+    df = load_data(selected_table)
+    
+    if not df.empty:
+        st.success(f"✅ {len(df)} pumps loaded")
+        st.metric("Flow Range", f"{df['Max Flow (LPM)'].min():.0f} - {df['Max Flow (LPM)'].max():.0f} LPM")
+        st.metric("Head Range", f"{df['Max Head (M)'].min():.1f} - {df['Max Head (M)'].max():.1f} m")
+    else:
+        st.error("❌ No data loaded")
+    
+    st.header("💡 Example Questions")
+    st.write("• I need a pump for 500 LPM and 10 meters head")
+    st.write("• What pumps can handle 200 LPM?")
+    st.write("• Show me pumps with 15m head capacity")
+    st.write("• What's the best pump for my pool?")
 
 # Initialize chat history
 if "messages" not in st.session_state:
     st.session_state.messages = [
-        {"role": "assistant", "content": "Hello! I'm your pump selection assistant. I can help you find the right pump based on your flow and head requirements. What specifications do you need?"}
+        {"role": "assistant", "content": "Hello! I'm your intelligent pump selection assistant. I can help you find the perfect pump based on your flow and head requirements. Just tell me what you need! 🚀"}
     ]
 
 # Display chat messages from history
@@ -96,161 +230,61 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# --- User Input ---
-col1, col2 = st.columns(2)
-with col1:
-    flow = st.number_input("Required Flow (LPM)", min_value=0.0, value=0.0, step=1.0)
-with col2:
-    head = st.number_input("Required Head (m)", min_value=0.0, value=0.0, step=0.5)
-
-# Load data
-df = load_data(selected_table)
-
-# --- Search and Filter ---
-if st.button("Search", disabled=(flow <= 0 or head <= 0)):
-    if flow <= 0 or head <= 0:
-        st.warning("Please enter valid flow and head requirements.")
-    else:
-        # Add user message to chat history
-        user_message = f"I need a pump with {flow} LPM flow and {head} meters head."
-        st.session_state.messages.append({"role": "user", "content": user_message})
-        
-        # Display user message
-        with st.chat_message("user"):
-            st.markdown(user_message)
-
-        # Display assistant response
-        with st.chat_message("assistant"):
-            message_placeholder = st.empty()
-            
-            if df.empty:
-                response_text = "I'm sorry, but I'm having trouble accessing the pump database at the moment. Please try again later."
-            else:
-                # Filter pumps that meet requirements
-                # Use >= for flow and head to find pumps that can handle AT LEAST the required specs
-                filtered = df[
-                    (df["Max Flow (LPM)"] >= flow) &
-                    (df["Max Head (M)"] >= head)
-                ]
-
-                # Prepare response
-                if filtered.empty:
-                    response_text = f"I couldn't find any pumps that can handle {flow} LPM flow and {head} meters head. You might need to consider:\n\n"
-                    response_text += "• Reducing your flow or head requirements\n"
-                    response_text += "• Using multiple pumps in parallel (for higher flow)\n"
-                    response_text += "• Using pumps in series (for higher head)\n"
-                    response_text += "\nWould you like to try different specifications?"
-                else:
-                    # Sort by efficiency - closest to requirements without being oversized
-                    filtered = filtered.copy()
-                    filtered["flow_efficiency"] = filtered["Max Flow (LPM)"] / flow
-                    filtered["head_efficiency"] = filtered["Max Head (M)"] / head
-                    filtered["total_efficiency"] = filtered["flow_efficiency"] + filtered["head_efficiency"]
-                    filtered = filtered.sort_values("total_efficiency")
-                    
-                    response_text = f"Great! I found {len(filtered)} suitable pump(s) for your requirements ({flow} LPM, {head}m head).\n\n"
-                    response_text += "Here are the best matches (sorted by efficiency):\n\n"
-                    
-                    # Show top 5 results to avoid overwhelming the user
-                    top_results = filtered.head(5)
-                    for i, (_, row) in enumerate(top_results.iterrows(), 1):
-                        response_text += f"**{i}. {row['Model No.']}**\n"
-                        response_text += f"   • Max Flow: {row['Max Flow (LPM)']} LPM\n"
-                        response_text += f"   • Max Head: {row['Max Head (M)']} m\n"
-                        if 'Product Link' in row and pd.notna(row['Product Link']):
-                            response_text += f"   • Product Link: {row['Product Link']}\n"
-                        response_text += "\n"
-                    
-                    if len(filtered) > 5:
-                        response_text += f"*({len(filtered) - 5} more options available in the detailed results below)*"
-
-            # Simulate typing effect (reduced delay for better UX)
-            words = response_text.split()
-            displayed_text = ""
-            for i, word in enumerate(words):
-                displayed_text += word + " "
-                if i % 5 == 0:  # Update every 5 words instead of every word
-                    message_placeholder.markdown(displayed_text + "▌")
-                    time.sleep(0.02)  # Reduced delay
-            
-            message_placeholder.markdown(response_text)
-
-        # Add assistant response to chat history
-        st.session_state.messages.append({"role": "assistant", "content": response_text})
-
-        # Display results in a structured table
-        if not df.empty and not filtered.empty:
-            st.success(f"Found {len(filtered)} matching pump(s).")
-            
-            # Prepare display columns
-            display_columns = ["Model No.", "Max Flow (LPM)", "Max Head (M)"]
-            if "Product Link" in filtered.columns:
-                display_columns.append("Product Link")
-            
-            # Show the filtered results
-            st.dataframe(
-                filtered[display_columns].reset_index(drop=True),
-                use_container_width=True,
-                hide_index=True
-            )
-
-            # --- Optional GPT Summary (RAG) ---
-            if "OPENAI_API_KEY" in st.secrets:
-                with st.expander("💬 AI Recommendation"):
-                    try:
-                        # Prepare data for AI analysis
-                        top_3 = filtered.head(3)
-                        pump_data = top_3[["Model No.", "Max Flow (LPM)", "Max Head (M)"]].to_string(index=False)
-                        
-                        summary_prompt = f"""
-You are a pump selection expert. Based on the following pump specifications, recommend the best pump for a user who needs {flow} LPM flow and {head} meters head.
-
-Available pumps (sorted by efficiency):
-{pump_data}
-
-Consider:
-1. Which pump best matches the requirements without being oversized
-2. Energy efficiency (closer to required specs = more efficient)
-3. Any other engineering considerations
-
-Provide a clear recommendation with reasoning. Keep it concise and practical.
-"""
-                        
-                        # Use the updated OpenAI API with gpt-4o-mini
-                        client = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-                        
-                        response = client.chat.completions.create(
-                            model="gpt-4o-mini",
-                            messages=[{"role": "user", "content": summary_prompt}],
-                            max_tokens=300,
-                            temperature=0.3
-                        )
-                        
-                        st.write(response.choices[0].message.content)
-                        
-                    except Exception as e:
-                        st.error(f"Error generating AI recommendation: {str(e)}")
-            else:
-                st.info("💡 Add your OpenAI API key to secrets for AI-powered recommendations!")
-
-# --- Sidebar with additional info ---
-with st.sidebar:
-    st.header("📊 Database Info")
-    if not df.empty:
-        st.metric("Total Pumps", len(df))
-        st.metric("Flow Range", f"{df['Max Flow (LPM)'].min():.0f} - {df['Max Flow (LPM)'].max():.0f} LPM")
-        st.metric("Head Range", f"{df['Max Head (M)'].min():.1f} - {df['Max Head (M)'].max():.1f} m")
-    else:
-        st.warning("Database not accessible")
+# Accept user input
+if prompt := st.chat_input("Ask me about pumps... (e.g., 'I need 500 LPM and 10m head')"):
+    # Add user message to chat history
+    st.session_state.messages.append({"role": "user", "content": prompt})
     
-    st.header("💡 Tips")
-    st.write("• Choose pumps close to your requirements for better efficiency")
-    st.write("• Higher capacity pumps use more energy")
-    st.write("• Consider system losses in your calculations")
+    # Display user message in chat message container
+    with st.chat_message("user"):
+        st.markdown(prompt)
+    
+    # Display assistant response in chat message container
+    with st.chat_message("assistant"):
+        message_placeholder = st.empty()
+        full_response = ""
+        
+        if df.empty:
+            assistant_response = "I'm sorry, but I can't access the pump database right now. Please check the connection and try again."
+        else:
+            # Extract flow and head from user message
+            flow, head = extract_flow_head_from_text(prompt)
+            
+            # Generate AI response
+            assistant_response = generate_ai_response(prompt, df, flow, head)
+        
+        # Simulate stream of response with typing effect
+        words = assistant_response.split()
+        for i, word in enumerate(words):
+            full_response += word + " "
+            if i % 3 == 0:  # Update every 3 words for smoother animation
+                time.sleep(0.03)
+                # Add a blinking cursor to simulate typing
+                message_placeholder.markdown(full_response + "▌")
+        
+        message_placeholder.markdown(full_response)
+        
+        # If we found specific pumps, show them in a table
+        if not df.empty and flow is not None and head is not None:
+            filtered_pumps = search_pumps(df, flow, head)
+            if not filtered_pumps.empty:
+                st.subheader("🎯 Matching Pumps")
+                display_columns = ["Model No.", "Max Flow (LPM)", "Max Head (M)"]
+                if "Product Link" in filtered_pumps.columns:
+                    display_columns.append("Product Link")
+                
+                st.dataframe(
+                    filtered_pumps[display_columns].head(10).reset_index(drop=True),
+                    use_container_width=True,
+                    hide_index=True
+                )
+    
+    # Add assistant response to chat history
+    st.session_state.messages.append({"role": "assistant", "content": full_response})
 
-# --- Clear chat history button ---
-if st.button("Clear Chat History"):
+# Clear chat history button
+if st.sidebar.button("🗑️ Clear Chat History"):
     st.session_state.messages = [
-        {"role": "assistant", "content": "Hello! I'm your pump selection assistant. I can help you find the right pump based on your flow and head requirements. What specifications do you need?"}
+        {"role": "assistant", "content": "Hello! I'm your intelligent pump selection assistant. I can help you find the perfect pump based on your flow and head requirements. Just tell me what you need! 🚀"}
     ]
     st.rerun()
