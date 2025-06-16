@@ -216,10 +216,11 @@ Consider:
 Provide a clear recommendation with reasoning. Keep it concise and practical.
 """
                         
-                        # Use the updated OpenAI API
+                        # Use the updated OpenAI API with gpt-4o-mini
                         client = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+                        
                         response = client.chat.completions.create(
-                            model="gpt-4",
+                            model="gpt-4o-mini",
                             messages=[{"role": "user", "content": summary_prompt}],
                             max_tokens=300,
                             temperature=0.3
