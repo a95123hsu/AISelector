@@ -1,10 +1,9 @@
 streamlit
-langchain_openai
 pandas
 openai
 supabase
-time
-postgrest
-re
 plotly
-io
+langchain
+langchain-openai
+langchain-community
+faiss-cpu
