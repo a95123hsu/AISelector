@@ -77,30 +77,41 @@ def plot_pump_curve(df, model_no):
         # Find the pump model
         pump_data = df[df["Model No."] == model_no]
         if pump_data.empty:
+            st.error(f"Model {model_no} not found in database")
             return None
         
         pump_row = pump_data.iloc[0]
         
-        # Extract head vs flow data points
-        head_columns = [col for col in df.columns if 'M' in col and col not in ['Model No.', 'Max Flow (LPM)', 'Max Head (M)']]
-        head_columns = [col for col in head_columns if col.replace('M', '').replace('.', '').replace(' ', '').isdigit()]
-        
+        # Extract head vs flow data points from columns like "3M", "6M", "9M" etc.
         flows = []
         heads = []
         
-        for col in head_columns:
-            if pd.notna(pump_row[col]) and pump_row[col] > 0:
-                # Extract head value from column name
-                head_str = col.replace('M', '').replace(' ', '')
+        # Get all columns that represent head measurements
+        for col in df.columns:
+            if col.endswith('M') and col not in ['Model No.', 'Max Flow (LPM)', 'Max Head (M)', 'Max Head(M)']:
                 try:
-                    head_val = float(head_str)
-                    flow_val = float(pump_row[col])
-                    heads.append(head_val)
-                    flows.append(flow_val)
-                except:
+                    # Extract head value from column name (e.g., "3M" -> 3.0)
+                    head_str = col.replace('M', '').strip()
+                    if head_str.replace('.', '').isdigit():
+                        head_val = float(head_str)
+                        flow_val = pump_row[col]
+                        
+                        # Only add if flow value exists and is positive
+                        if pd.notna(flow_val) and flow_val > 0:
+                            heads.append(head_val)
+                            flows.append(float(flow_val))
+                except (ValueError, TypeError):
                     continue
         
+        # Debug: Show what data we found
+        st.write(f"**Debug info for {model_no}:**")
+        st.write(f"Found {len(flows)} data points")
+        if len(flows) > 0:
+            for h, f in zip(heads, flows):
+                st.write(f"Head: {h}m → Flow: {f} LPM")
+        
         if len(flows) < 2:
+            st.warning(f"Not enough data points to plot curve for {model_no} (found {len(flows)} points)")
             return None
         
         # Sort by head for proper curve
@@ -127,8 +138,8 @@ def plot_pump_curve(df, model_no):
             yaxis_title='Head (meters)',
             showlegend=True,
             template='plotly_white',
-            width=600,
-            height=400,
+            width=700,
+            height=500,
             hovermode='x unified'
         )
         
@@ -340,6 +351,13 @@ with st.sidebar:
         st.metric("Flow Range", f"{df['Max Flow (LPM)'].min():.0f} - {df['Max Flow (LPM)'].max():.0f} LPM")
         st.metric("Head Range", f"{df['Max Head (M)'].min():.1f} - {df['Max Head (M)'].max():.1f} m")
         
+        # Debug: Show column names
+        st.header("📋 Available Columns")
+        head_cols = [col for col in df.columns if col.endswith('M')]
+        st.write("Head measurement columns:")
+        for col in head_cols:
+            st.text(f"• {col}")
+        
         st.header("🎯 Available Models")
         models = df["Model No."].unique()[:10]  # Show first 10 models
         for model in models:
@@ -421,12 +439,9 @@ if prompt := st.chat_input("Ask me about pumps... (e.g., 'I need 500 LPM and 10m
         # Show matching pumps table if found
         if response_data["show_pumps"] and not response_data["pumps_data"].empty:
             st.subheader("🎯 Recommended Pumps")
-            display_columns = ["Model No.", "Max Flow (LPM)", "Max Head (M)"]
-            if "Product Link" in response_data["pumps_data"].columns:
-                display_columns.append("Product Link")
-            
+            # Show ALL columns
             st.dataframe(
-                response_data["pumps_data"][display_columns].head(10).reset_index(drop=True),
+                response_data["pumps_data"].head(10).reset_index(drop=True),
                 use_container_width=True,
                 hide_index=True
             )
